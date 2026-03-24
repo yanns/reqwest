@@ -1,12 +1,12 @@
 use hyper_util::client::legacy::connect::dns::Name as HyperName;
 use tower_service::Service;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
 
 use crate::error::BoxError;
@@ -172,6 +172,68 @@ where
 {
     fn into_resolve(self) -> Arc<dyn Resolve> {
         Arc::new(self)
+    }
+}
+
+/// Shared state tracking the current set of valid IPs per hostname.
+/// Updated by `DnsTrackingResolver` on every resolution.
+pub(crate) type DnsState = Arc<RwLock<HashMap<String, HashSet<IpAddr>>>>;
+
+/// Attached to each connection; holds the info needed to decide
+/// whether the connection's IP is still valid.
+#[derive(Clone, Debug)]
+pub(crate) struct DnsCheck {
+    pub(crate) hostname: String,
+    pub(crate) connected_ip: IpAddr,
+    pub(crate) dns_state: DnsState,
+}
+
+impl DnsCheck {
+    /// Returns `true` when the DNS state has been updated **and** this
+    /// connection's IP is no longer in the valid set.
+    pub(crate) fn is_obsolete(&self) -> bool {
+        if let Ok(state) = self.dns_state.read() {
+            if let Some(valid_ips) = state.get(&self.hostname) {
+                return !valid_ips.contains(&self.connected_ip);
+            }
+        }
+        // No record yet → not obsolete (first resolution hasn't happened through us)
+        false
+    }
+}
+
+/// Resolver wrapper that updates a shared [`DnsState`] on every resolution.
+pub(crate) struct DnsTrackingResolver {
+    inner: Arc<dyn Resolve>,
+    state: DnsState,
+}
+
+impl DnsTrackingResolver {
+    pub(crate) fn new(inner: Arc<dyn Resolve>, state: DnsState) -> Self {
+        Self { inner, state }
+    }
+}
+
+impl Resolve for DnsTrackingResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let inner = self.inner.clone();
+        let state = self.state.clone();
+        let hostname = name.as_str().to_string();
+
+        Box::pin(async move {
+            let addrs = inner.resolve(name).await?;
+
+            // Collect into a Vec so we can both inspect and return them.
+            let addrs_vec: Vec<SocketAddr> = addrs.collect();
+            let new_ips: HashSet<IpAddr> = addrs_vec.iter().map(|a| a.ip()).collect();
+
+            if let Ok(mut map) = state.write() {
+                map.insert(hostname, new_ips);
+            }
+
+            let result: Addrs = Box::new(addrs_vec.into_iter());
+            Ok(result)
+        })
     }
 }
 

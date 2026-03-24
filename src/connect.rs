@@ -26,9 +26,10 @@ use std::time::Duration;
 use self::native_tls_conn::NativeTlsConn;
 #[cfg(feature = "__rustls")]
 use self::rustls_tls_conn::RustlsTlsConn;
-use crate::dns::DynResolver;
+use crate::dns::{DnsCheck, DnsState, DynResolver};
 use crate::error::{cast_to_internal_error, BoxError};
 use crate::proxy::{Intercepted, Matcher as ProxyMatcher};
+use hyper_util::client::legacy::connect::HttpInfo;
 use sealed::{Conn, Unnameable};
 
 pub(crate) type HttpConnector = hyper_util::client::legacy::connect::HttpConnector<DynResolver>;
@@ -80,6 +81,7 @@ pub(crate) struct ConnectorBuilder {
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: Option<DynResolver>,
+    dns_state: Option<DnsState>,
     #[cfg(unix)]
     unix_socket: Option<Arc<std::path::Path>>,
     #[cfg(target_os = "windows")]
@@ -103,6 +105,7 @@ where {
             simple_timeout: None,
             #[cfg(feature = "socks")]
             resolver: self.resolver.unwrap_or_else(DynResolver::gai),
+            dns_state: self.dns_state,
             #[cfg(unix)]
             unix_socket: self.unix_socket,
             #[cfg(target_os = "windows")]
@@ -215,6 +218,7 @@ where {
             timeout: None,
             #[cfg(feature = "socks")]
             resolver: None,
+            dns_state: None,
             #[cfg(unix)]
             unix_socket: None,
             #[cfg(target_os = "windows")]
@@ -328,6 +332,7 @@ where {
             timeout: None,
             #[cfg(feature = "socks")]
             resolver: None,
+            dns_state: None,
             #[cfg(unix)]
             unix_socket: None,
             #[cfg(target_os = "windows")]
@@ -403,6 +408,7 @@ where {
             timeout: None,
             #[cfg(feature = "socks")]
             resolver: None,
+            dns_state: None,
             #[cfg(unix)]
             unix_socket: None,
             #[cfg(target_os = "windows")]
@@ -477,6 +483,10 @@ where {
     pub(crate) fn set_windows_named_pipe(&mut self, pipe: Option<Arc<std::ffi::OsStr>>) {
         self.windows_named_pipe = pipe;
     }
+
+    pub(crate) fn set_dns_state(&mut self, state: Option<DnsState>) {
+        self.dns_state = state;
+    }
 }
 
 #[allow(missing_debug_implementations)]
@@ -498,6 +508,7 @@ pub(crate) struct ConnectorService {
     user_agent: Option<HeaderValue>,
     #[cfg(feature = "socks")]
     resolver: DynResolver,
+    dns_state: Option<DnsState>,
     /// If set, this always takes priority over TCP.
     #[cfg(unix)]
     unix_socket: Option<Arc<std::path::Path>>,
@@ -533,6 +544,33 @@ impl Inner {
     }
 }
 
+/// Build a [`DnsCheck`] for the given destination, if DNS-aware pool
+/// eviction is enabled (`dns_state` is `Some`).
+///
+/// `conn` is anything that implements `Connection` — we call
+/// `.connected()` on it and pull the remote address out of the
+/// `HttpInfo` extra that `HttpConnector` attaches.
+fn dns_check_for<C: Connection>(
+    dns_state: &Option<DnsState>,
+    dst: &Uri,
+    conn: &C,
+) -> Option<DnsCheck> {
+    let dns_state = dns_state.as_ref()?;
+    let hostname = dst.host().unwrap_or("").to_string();
+
+    // Extract the remote IP from the Connected extras set by HttpConnector.
+    let connected = conn.connected();
+    let mut extensions = http::Extensions::new();
+    connected.get_extras(&mut extensions);
+    let remote_ip = extensions.get::<HttpInfo>()?.remote_addr().ip();
+
+    Some(DnsCheck {
+        hostname,
+        connected_ip: remote_ip,
+        dns_state: Arc::clone(dns_state),
+    })
+}
+
 impl ConnectorService {
     #[cfg(feature = "socks")]
     async fn connect_socks(mut self, dst: Uri, proxy: Intercepted) -> Result<Conn, BoxError> {
@@ -559,6 +597,7 @@ impl ConnectorService {
                         inner: self.verbose.wrap(NativeTlsConn { inner: io }),
                         is_proxy: false,
                         tls_info: self.tls_info,
+                        dns_check: None,
                     });
                 }
             }
@@ -584,6 +623,7 @@ impl ConnectorService {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: io }),
                         is_proxy: false,
                         tls_info: false,
+                        dns_check: None,
                     });
                 }
             }
@@ -594,6 +634,7 @@ impl ConnectorService {
                     inner: self.verbose.wrap(TokioIo::new(conn)),
                     is_proxy: false,
                     tls_info: false,
+                    dns_check: None,
                 });
             }
         }
@@ -606,19 +647,23 @@ impl ConnectorService {
                 inner: self.verbose.wrap(TokioIo::new(tcp)),
                 is_proxy: false,
                 tls_info: false,
+                dns_check: None,
             })
             .map_err(Into::into)
     }
 
     async fn connect_with_maybe_proxy(self, dst: Uri, is_proxy: bool) -> Result<Conn, BoxError> {
+        let dns_state = self.dns_state.clone();
         match self.inner {
             #[cfg(not(feature = "__tls"))]
             Inner::Http(mut http) => {
-                let io = http.call(dst).await?;
+                let io = http.call(dst.clone()).await?;
+                let dns_check = dns_check_for(&dns_state, &dst, &io);
                 Ok(Conn {
                     inner: self.verbose.wrap(io),
                     is_proxy,
                     tls_info: false,
+                    dns_check,
                 })
             }
             #[cfg(feature = "__native-tls")]
@@ -634,7 +679,8 @@ impl ConnectorService {
 
                 let tls_connector = tokio_native_tls::TlsConnector::from(tls.clone());
                 let mut http = hyper_tls::HttpsConnector::from((http, tls_connector));
-                let io = http.call(dst).await?;
+                let io = http.call(dst.clone()).await?;
+                let dns_check = dns_check_for(&dns_state, &dst, &io);
 
                 if let hyper_tls::MaybeHttpsStream::Https(stream) = io {
                     if !self.nodelay {
@@ -651,12 +697,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        dns_check,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        dns_check,
                     })
                 }
             }
@@ -672,7 +720,8 @@ impl ConnectorService {
                 }
 
                 let mut http = hyper_rustls::HttpsConnector::from((http, tls.clone()));
-                let io = http.call(dst).await?;
+                let io = http.call(dst.clone()).await?;
+                let dns_check = dns_check_for(&dns_state, &dst, &io);
 
                 if let hyper_rustls::MaybeHttpsStream::Https(stream) = io {
                     if !self.nodelay {
@@ -683,12 +732,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        dns_check,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        dns_check,
                     })
                 }
             }
@@ -736,6 +787,7 @@ impl ConnectorService {
                     inner: self.verbose.wrap(io),
                     is_proxy,
                     tls_info: false,
+                    dns_check: None,
                 })
             }
             #[cfg(feature = "__native-tls")]
@@ -749,12 +801,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(NativeTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        dns_check: None,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        dns_check: None,
                     })
                 }
             }
@@ -768,12 +822,14 @@ impl ConnectorService {
                         inner: self.verbose.wrap(RustlsTlsConn { inner: stream }),
                         is_proxy,
                         tls_info: self.tls_info,
+                        dns_check: None,
                     })
                 } else {
                     Ok(Conn {
                         inner: self.verbose.wrap(io),
                         is_proxy,
                         tls_info: false,
+                        dns_check: None,
                     })
                 }
             }
@@ -834,6 +890,7 @@ impl ConnectorService {
                         }),
                         is_proxy: false,
                         tls_info: false,
+                        dns_check: None,
                     });
                 }
             }
@@ -881,6 +938,7 @@ impl ConnectorService {
                         }),
                         is_proxy: false,
                         tls_info: false,
+                        dns_check: None,
                     });
                 }
             }
@@ -1301,6 +1359,7 @@ pub(crate) mod sealed {
             pub(super) is_proxy: bool,
             // Only needed for __tls, but #[cfg()] on fields breaks pin_project!
             pub(super) tls_info: bool,
+            pub(super) dns_check: Option<DnsCheck>,
         }
     }
 
@@ -1322,6 +1381,25 @@ pub(crate) mod sealed {
         }
     }
 
+    /// If the DNS check indicates the connection's IP is obsolete,
+    /// return a `ConnectionReset` error so hyper evicts it from the pool.
+    fn check_dns(dns_check: &Option<DnsCheck>) -> io::Result<()> {
+        if let Some(ref check) = *dns_check {
+            if check.is_obsolete() {
+                log::debug!(
+                    "connection to {} via {} is stale (DNS changed), resetting",
+                    check.hostname,
+                    check.connected_ip,
+                );
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionReset,
+                    "DNS no longer resolves to this connection's IP",
+                ));
+            }
+        }
+        Ok(())
+    }
+
     impl Read for Conn {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -1329,6 +1407,7 @@ pub(crate) mod sealed {
             buf: ReadBufCursor<'_>,
         ) -> Poll<io::Result<()>> {
             let this = self.project();
+            check_dns(this.dns_check)?;
             Read::poll_read(this.inner, cx, buf)
         }
     }
@@ -1340,6 +1419,7 @@ pub(crate) mod sealed {
             buf: &[u8],
         ) -> Poll<Result<usize, io::Error>> {
             let this = self.project();
+            check_dns(this.dns_check)?;
             Write::poll_write(this.inner, cx, buf)
         }
 

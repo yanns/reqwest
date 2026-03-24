@@ -31,7 +31,9 @@ use crate::cookie;
 use crate::cookie::service::CookieService;
 #[cfg(feature = "hickory-dns")]
 use crate::dns::hickory::HickoryDnsResolver;
-use crate::dns::{gai::GaiResolver, DnsResolverWithOverrides, DynResolver, Resolve};
+use crate::dns::{
+    gai::GaiResolver, DnsResolverWithOverrides, DnsState, DnsTrackingResolver, DynResolver, Resolve,
+};
 use crate::error::{self, BoxError};
 use crate::into_url::try_uri;
 use crate::proxy::Matcher as ProxyMatcher;
@@ -260,6 +262,7 @@ struct Config {
     h3_send_grease: Option<bool>,
     dns_overrides: HashMap<String, Vec<SocketAddr>>,
     dns_resolver: Option<Arc<dyn Resolve>>,
+    dns_aware_pool_eviction: bool,
 
     #[cfg(unix)]
     unix_socket: Option<Arc<std::path::Path>>,
@@ -384,6 +387,7 @@ impl ClientBuilder {
                 #[cfg(feature = "http3")]
                 h3_send_grease: None,
                 dns_resolver: None,
+                dns_aware_pool_eviction: false,
                 #[cfg(unix)]
                 unix_socket: None,
                 #[cfg(target_os = "windows")]
@@ -417,7 +421,7 @@ impl ClientBuilder {
         #[cfg(feature = "http3")]
         let mut h3_connector = None;
 
-        let resolver = {
+        let (resolver, dns_state) = {
             let mut resolver: Arc<dyn Resolve> = match config.hickory_dns {
                 false => Arc::new(GaiResolver::new()),
                 #[cfg(feature = "hickory-dns")]
@@ -434,7 +438,20 @@ impl ClientBuilder {
                     config.dns_overrides,
                 ));
             }
-            DynResolver::new(resolver)
+
+            // When DNS-aware pool eviction is enabled, wrap the resolver so
+            // that every resolution updates a shared DnsState.  The same
+            // DnsState is later handed to ConnectorService so that each Conn
+            // can check whether its remote IP is still valid.
+            let dns_state = if config.dns_aware_pool_eviction {
+                let state: DnsState = Default::default();
+                resolver = Arc::new(DnsTrackingResolver::new(resolver, state.clone()));
+                Some(state)
+            } else {
+                None
+            };
+
+            (DynResolver::new(resolver), dns_state)
         };
 
         let mut connector_builder = {
@@ -918,6 +935,7 @@ impl ClientBuilder {
 
         #[cfg(feature = "socks")]
         connector_builder.set_socks_resolver(resolver);
+        connector_builder.set_dns_state(dns_state);
 
         // TODO: It'd be best to refactor this so the HttpConnector is never
         // constructed at all. But there's a lot of code for all the different
@@ -2289,6 +2307,23 @@ impl ClientBuilder {
         R: crate::dns::resolve::IntoResolve,
     {
         self.config.dns_resolver = Some(resolver.into_resolve());
+        self
+    }
+
+    /// Enable DNS-aware connection pool eviction.
+    ///
+    /// When enabled, every DNS resolution updates a shared set of valid IPs
+    /// per hostname.  Pooled connections whose remote IP is no longer present
+    /// in the latest resolution are automatically reset on next use, which
+    /// causes hyper to drop them from the pool and open a fresh connection
+    /// to the new address.
+    ///
+    /// This is useful for long-lived clients that need to react quickly to
+    /// DNS changes (e.g. blue/green deployments, failovers).
+    ///
+    /// Default is `false`.
+    pub fn dns_aware_pool_eviction(mut self, enable: bool) -> ClientBuilder {
+        self.config.dns_aware_pool_eviction = enable;
         self
     }
 

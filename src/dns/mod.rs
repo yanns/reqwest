@@ -1,7 +1,9 @@
 //! DNS resolution
 
 pub use resolve::{Addrs, Name, Resolve, Resolving};
-pub(crate) use resolve::{DnsResolverWithOverrides, DynResolver};
+pub(crate) use resolve::{
+    DnsCheck, DnsResolverWithOverrides, DnsState, DnsTrackingResolver, DynResolver,
+};
 
 #[cfg(docsrs)]
 pub use resolve::IntoResolve;
